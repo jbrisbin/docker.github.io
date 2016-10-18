@@ -10,99 +10,94 @@ title: Dockerizing a Riak service
 
 # Dockerizing a Riak service
 
-The goal of this example is to show you how to build a Docker image with
-Riak pre-installed.
+The goal of this example is to show you how to build a Docker image with Riak pre-installed.
 
 ## Creating a Dockerfile
 
-Create an empty file called `Dockerfile`:
+Create a new `Dockerfile`:
 
-    $ touch Dockerfile
+    $ vi Dockerfile
 
-Next, define the parent image you want to use to build your image on top
-of. We'll use [Ubuntu](https://hub.docker.com/_/ubuntu/) (tag:
-`trusty`), which is available on [Docker Hub](https://hub.docker.com):
+Next, define the parent image on which you want to base your own. We'll use [Ubuntu](https://hub.docker.com/_/ubuntu/) (tag: `trusty`), which is available on [Docker Hub](https://hub.docker.com):
 
     # Riak
     #
-    # VERSION       0.1.1
-
-    # Use the Ubuntu base image provided by dotCloud
+    # Use the official Ubuntu Trusty base image
     FROM ubuntu:trusty
-    MAINTAINER Hector Castro hector@basho.com
 
-After that, we install the curl which is used to download the repository setup
-script and we download the setup script and run it.
+We need to install `curl` to download the repository setup script from `packagecloud.io`:
 
-    # Install Riak repository before we do apt-get update, so that update happens
-    # in a single step
-    RUN apt-get install -q -y curl && \
-        curl -fsSL https://packagecloud.io/install/repositories/basho/riak/script.deb | sudo bash
+    # Install Riak repository before we do apt-get update
+    RUN apt-get install -q -y curl
+    # Install package sources for Riak KV. For Riak TS, change `riak` to `riak-ts`.
+    RUN curl -fsSL https://packagecloud.io/install/repositories/basho/riak/script.deb | sudo bash
 
-Then we install and setup a few dependencies:
-
- - `supervisor` is used manage the Riak processes
- - `riak=2.0.5-1` is the Riak package coded to version 2.0.5
+Then we install Riak itself:
 
 <!-- -->
 
-    # Install and setup project dependencies
-    RUN apt-get update && \
-        apt-get install -y supervisor riak=2.0.5-1
-
-    RUN mkdir -p /var/log/supervisor
-
+    # Install specific version of Riak, governed by `--build-arg RIAK_VERSION`
+    ARG RIAK_VERSION=2.0.7-1
+    RUN apt-get install -y riak=$RIAK_VERSION
+    # Generate Locale for UTF-8
     RUN locale-gen en_US en_US.UTF-8
 
-    COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-After that, we modify Riak's configuration:
-
-    # Configure Riak to accept connections from any host
-    RUN sed -i "s|listener.http.internal = 127.0.0.1:8098|listener.http.internal = 0.0.0.0:8098|" /etc/riak/riak.conf
-    RUN sed -i "s|listener.protobuf.internal = 127.0.0.1:8087|listener.protobuf.internal = 0.0.0.0:8087|" /etc/riak/riak.conf
-
-Then, we expose the Riak Protocol Buffers and HTTP interfaces:
+We expose the Riak Protocol Buffers and HTTP interfaces on their default ports:
 
     # Expose Riak Protocol Buffers and HTTP interfaces
     EXPOSE 8087 8098
 
-Finally, run `supervisord` so that Riak is started:
+Now we need to create a special start script that will echo our IP address into the Riak configuration before starting the node. This will ensure the node can be connected to from other Docker containers using a valid IP address. There are some functions of Riak, like [Full Bucket Reads](http://basho.com/products/riak-kv/apache-spark-connector/), that need a valid IP address to be set as the node name so the client can connect back to it.
 
-    CMD ["/usr/bin/supervisord"]
+The following is based on [the official Riak Docker image script](https://github.com/basho-labs/riak-docker/blob/master/riak-cluster.sh#L27) that performs a similar function. 
 
-## Create a supervisord configuration file
+Create a script file:
 
-Create an empty file called `supervisord.conf`. Make
-sure it's at the same directory level as your `Dockerfile`:
+    $ vi start-riak.sh
 
-    touch supervisord.conf
+Add some logic to use `ping` to discover our IP address and echo that information into `/etc/riak/riak.conf`:
 
-Populate it with the following program definitions:
+    #!/bin/bash
 
-    [supervisord]
-    nodaemon=true
+    HOST=$(ping -c1 $HOSTNAME | awk '/^PING/ {print $3}' | sed 's/[()]//g')||'127.0.0.1'
+    cat <<END >>/etc/riak/riak.conf
+    nodename = riak@$HOST
+    listener.protobuf.internal = $HOST:8087
+    listener.http.internal = $HOST:8098
+    END
 
-    [program:riak]
-    command=bash -c "/usr/sbin/riak console"
-    numprocs=1
-    autostart=true
-    autorestart=true
-    user=riak
-    environment=HOME="/var/lib/riak"
-    stdout_logfile=/var/log/supervisor/%(program_name)s.log
-    stderr_logfile=/var/log/supervisor/%(program_name)s.log
+    riak start
+    riak-admin wait-for-service riak_kv
+
+    tail -n 1024 -f /var/log/riak/console.log
+
+Add this script to the Docker image:
+
+    COPY start-riak.sh /usr/sbin/start-riak.sh
+    RUN chmod a+x /usr/sbin/start-riak.sh
+
+    CMD ["/usr/sbin/start-riak.sh"]
 
 ## Build the Docker image for Riak
 
 Now you should be able to build a Docker image for Riak:
 
-    $ docker build -t "<yourname>/riak" .
+    $ docker build -t "<yourname>/riak-kv" .
+
+## Run a single node Riak
+
+Once the image is built, you can run a single node of Riak by using `docker run`:
+
+    $ docker run -d --name=riak -p 8087:8087 -p 8098:8098 <yourname>/riak-kv
+    ... monitor whie Riak starts ...
+    $ docker logs riak
+
+Eventually you should see the log line indicating the node has started:
+
+    $ docker logs riak
+    ... log output ...
+    2016-10-18 15:54:46.841 [info] <0.7.0> Application riak_kv started on node 'riak@172.17.0.2'
 
 ## Next steps
 
-Riak is a distributed database. Many production deployments consist of
-[at least five nodes](
-http://basho.com/why-your-riak-cluster-should-have-at-least-five-nodes/).
-See the [docker-riak](https://github.com/hectcastro/docker-riak) project
-details on how to deploy a Riak cluster using Docker and Pipework.
+Riak is a distributed database. Many production deployments consist of [at least five nodes](http://basho.com/why-your-riak-cluster-should-have-at-least-five-nodes/). See the [riak-docker](https://github.com/basho-labs/riak-docker) project for details on how to deploy a Riak cluster using Docker.
